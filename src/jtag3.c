@@ -44,6 +44,10 @@
  *    also relates to the hidapi and libusb backends, see
  *    https://github.com/avrdudes/avrdude/issues/1221
  *
+ *  - Depending on the specific combination of MCU, ICE-FW version,
+ *    and operating procedures, memory may not be loaded correctly, see
+ *    https://github.com/avrdudes/avrdude/issues/1890
+ *
  *
  * Limitations
  *
@@ -135,6 +139,11 @@ struct pdata
   int (*set_sck)(const PROGRAMMER *, unsigned char *);
 
   unsigned char signature_cache[2]; // Used in jtag3_read_byte()
+
+  /* Experimental solution for issue #1890 */
+  unsigned char before_mtype;
+  unsigned char *saved_descriptors;
+  int saved_descriptors_size;
 };
 
 #define PDATA(pgm) ((struct pdata *)(pgm->cookie))
@@ -1038,7 +1047,7 @@ static int jtag3_initialize(const PROGRAMMER *pgm, const AVRPART *p) {
    * Allow to override the check by -F (so users could try on newer
    * firmware), but warn loudly.
    */
-  if (jtag3_getparm(pgm, SCOPE_GENERAL, 0, PARM3_FW_MAJOR, parm, 2) < 0)
+  if (jtag3_getparm(pgm, SCOPE_GENERAL, 0, PARM3_FW_MAJOR, parm, 4) < 0)
     return -1;
   if (pgm->fd.usb.max_xfer < USBDEV_MAX_XFER_3 && (pgm->flag & PGM_FL_IS_EDBG) == 0) {
     if (ovsigck) {
@@ -1048,6 +1057,22 @@ static int jtag3_initialize(const PROGRAMMER *pgm, const AVRPART *p) {
       pmsg_error("JTAGICE3's firmware %d.%d is broken on USB 1.1 connections\n", parm[0], parm[1]);
       return -1;
     }
+  }
+
+  /* Experimental solution for issue #1890 */
+  /*
+   * Try to fix the problem in the following example:
+   *
+   * avrdude -cxplainedpro_jtag -pm256rfr2 -U{sig,cal,sig,ee,sig}:r:-:I
+   *
+   * limited: ICE FW <= 3.37 (rel. 438)
+   */
+  PDATA(pgm)->before_mtype = 0;
+  PDATA(pgm)->saved_descriptors = 0;
+  PDATA(pgm)->saved_descriptors_size = 0;
+  unsigned short ice_rel = parm[2] | (parm[3] << 8);  /* PARM3_FW_RELEASE */
+  if (str_starts(pgmid, "xplainedpro") && ice_rel <= 438) {
+    PDATA(pgm)->before_mtype = MTYPE_SIGN_JTAG;
   }
 
   if (pgm->flag & PGM_FL_IS_DW) {
@@ -1218,6 +1243,13 @@ static int jtag3_initialize(const PROGRAMMER *pgm, const AVRPART *p) {
 
     if (jtag3_setparm(pgm, SCOPE_AVR, 2, PARM3_DEVICEDESC, (unsigned char *)&xd, sizeof xd) < 0)
       return -1;
+
+    /* Experimental solution for issue #1890 */
+    if (PDATA(pgm)->before_mtype) {
+      PDATA(pgm)->saved_descriptors_size = sizeof xd;
+      PDATA(pgm)->saved_descriptors = mmt_malloc(sizeof xd);
+      memcpy(PDATA(pgm)->saved_descriptors, &xd, sizeof xd);
+    }
   }
   else if ((p->prog_modes & PM_UPDI)) {
     struct updi_device_desc xd;
@@ -1324,6 +1356,13 @@ static int jtag3_initialize(const PROGRAMMER *pgm, const AVRPART *p) {
 
     if (jtag3_setparm(pgm, SCOPE_AVR, 2, PARM3_DEVICEDESC, (unsigned char *)&xd, sizeof xd) < 0)
       return -1;
+
+    /* Experimental solution for issue #1890 */
+    if (PDATA(pgm)->before_mtype) {
+      PDATA(pgm)->saved_descriptors_size = sizeof xd;
+      PDATA(pgm)->saved_descriptors = mmt_malloc(sizeof xd);
+      memcpy(PDATA(pgm)->saved_descriptors, &xd, sizeof xd);
+    }
   }
   else {
     struct mega_device_desc md;
@@ -1382,6 +1421,13 @@ static int jtag3_initialize(const PROGRAMMER *pgm, const AVRPART *p) {
 
     if (jtag3_setparm(pgm, SCOPE_AVR, 2, PARM3_DEVICEDESC, (unsigned char *)&md, sizeof md) < 0)
       return -1;
+
+    /* Experimental solution for issue #1890 */
+    if (PDATA(pgm)->before_mtype) {
+      PDATA(pgm)->saved_descriptors_size = sizeof md;
+      PDATA(pgm)->saved_descriptors = mmt_malloc(sizeof md);
+      memcpy(PDATA(pgm)->saved_descriptors, &md, sizeof md);
+    }
   }
 
   int use_ext_reset;
@@ -1894,6 +1940,14 @@ void jtag3_close(PROGRAMMER * pgm) {
     jtag3_edbg_signoff(pgm);
   }
 
+  /* Experimental solution for issue #1890 */
+  if (PDATA(pgm)->saved_descriptors) {
+    mmt_free(PDATA(pgm)->saved_descriptors);
+    /* I'm a bit talkative, but just to be sure */
+    PDATA(pgm)->saved_descriptors = 0;
+    PDATA(pgm)->saved_descriptors_size = 0;
+  }
+
   serial_close(&pgm->fd);
   pgm->fd.ifd = -1;
 }
@@ -1940,6 +1994,19 @@ static int jtag3_page_erase(const PROGRAMMER *pgm, const AVRPART *p, const AVRME
     return -1;
 
   mmt_free(resp);
+  return 0;
+}
+
+/* Experimental solution for issue #1890 */
+static int jtag3_reconf_descriptor(const PROGRAMMER *pgm, unsigned char mtype) {
+  if (PDATA(pgm)->saved_descriptors_size && PDATA(pgm)->before_mtype != mtype) {
+    /* If the MTYPE is different from the previous time, reissue SET_PARM3_DEVICEDESC. */
+    if (jtag3_setparm(pgm, SCOPE_AVR, 2, PARM3_DEVICEDESC,
+                                         PDATA(pgm)->saved_descriptors,
+                                         PDATA(pgm)->saved_descriptors_size) < 0)
+      return -1;
+    PDATA(pgm)->before_mtype = mtype;
+  }
   return 0;
 }
 
@@ -2018,6 +2085,12 @@ static int jtag3_paged_write(const PROGRAMMER *pgm, const AVRPART *p, const AVRM
     u32_to_b4(cmd + 4, jtag3_memaddr(pgm, p, m, addr));
     cmd[12] = 0;
 
+    /* Experimental solution for issue #1890 */
+    if (jtag3_reconf_descriptor(pgm, cmd[3]) < 0) {
+      mmt_free(cmd);
+      return -1;
+    }
+
     /*
      * The JTAG ICE will refuse to write anything but a full page, at
      * least for the flash ROM.  If a partial page has been requested,
@@ -2094,6 +2167,11 @@ static int jtag3_paged_load(const PROGRAMMER *pgm, const AVRPART *p, const AVRME
     cmd[3] = MTYPE_SPM;
   }
   serial_recv_timeout = 100;
+
+  /* Experimental solution for issue #1890 */
+  if (jtag3_reconf_descriptor(pgm, cmd[3]) < 0)
+    return -1;
+
   for (; addr < maxaddr; addr += page_size) {
     if ((maxaddr - addr) < page_size)
       block_size = maxaddr - addr;
@@ -2233,6 +2311,11 @@ static int jtag3_read_byte(const PROGRAMMER *pgm, const AVRPART *p, const AVRMEM
     u32_to_b4(cmd + 4, jtag3_memaddr(pgm, p, mem, addr));
 
     if (addr == 0) {
+
+      /* Experimental solution for issue #1890 */
+      if (jtag3_reconf_descriptor(pgm, cmd[3]) < 0)
+        return -1;
+
       if ((status = jtag3_command(pgm, cmd, 12, &resp, "read memory")) < 0)
         return status;
 
@@ -2294,6 +2377,10 @@ static int jtag3_read_byte(const PROGRAMMER *pgm, const AVRPART *p, const AVRMEM
     u32_to_b4(cmd + 8, 1);
     u32_to_b4(cmd + 4, jtag3_memaddr(pgm, p, mem, addr));
   }
+
+  /* Experimental solution for issue #1890 */
+  if (jtag3_reconf_descriptor(pgm, cmd[3]) < 0)
+    return -1;
 
   if ((status = jtag3_command(pgm, cmd, 12, &resp, "read memory")) < 0)
     return status;
@@ -2412,6 +2499,10 @@ static int jtag3_write_byte(const PROGRAMMER *pgm, const AVRPART *p, const AVRME
   u32_to_b4(cmd + 4, jtag3_memaddr(pgm, p, mem, addr));
   cmd[12] = 0;
   cmd[13] = data;
+
+  /* Experimental solution for issue #1890 */
+  if (jtag3_reconf_descriptor(pgm, cmd[3]) < 0)
+    return -1;
 
   if ((status = jtag3_command(pgm, cmd, 14, &resp, "write memory")) < 0)
     return status;
